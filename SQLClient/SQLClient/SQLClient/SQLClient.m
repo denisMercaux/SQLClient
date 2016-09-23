@@ -12,7 +12,6 @@
 #import "syberror.h"
 
 int const SQLClientDefaultTimeout = 5;
-int const SQLClientDefaultQueryTimeout = 5;
 NSString* const SQLClientDefaultCharset = @"UTF-8";
 NSString* const SQLClientWorkerQueueName = @"com.martinrybak.sqlclient";
 NSString* const SQLClientDelegateError = @"Delegate must be set to an NSObject that implements the SQLClientDelegate protocol";
@@ -47,10 +46,10 @@ struct COL
 //Initializes the FreeTDS library and sets callback handlers
 - (id)init
 {
-    if (self = [super init])
-    {
-        //Initialize the FreeTDS library
-        if (dbinit() == FAIL)
+	if (self = [super init])
+	{
+		//Initialize the FreeTDS library
+		if (dbinit() == FAIL)
 			return nil;
 		
 		//Initialize SQLClient
@@ -59,30 +58,31 @@ struct COL
 		self.callbackQueue = [NSOperationQueue currentQueue];
 		self.workerQueue = [[NSOperationQueue alloc] init];
 		self.workerQueue.name = SQLClientWorkerQueueName;
+		[self.workerQueue setMaxConcurrentOperationCount:1];
 		
-        //Set FreeTDS callback handlers
-        dberrhandle(err_handler);
-        dbmsghandle(msg_handler);
-    }
-    return self;
+		//Set FreeTDS callback handlers
+		dberrhandle(err_handler);
+		dbmsghandle(msg_handler);
+	}
+	return self;
 }
 
 //Exits the FreeTDS library
 - (void)dealloc
 {
-    dbexit();
+	dbexit();
 }
 
 #pragma mark - Public
 
-+ (instancetype)sharedInstance
++ (id)sharedInstance
 {
-    static SQLClient* sharedInstance = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        sharedInstance = [[self alloc] init];
-    });
-    return sharedInstance;
+	static SQLClient* sharedInstance = nil;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		sharedInstance = [[self alloc] init];
+	});
+	return sharedInstance;
 }
 
 - (void)connect:(NSString*)host
@@ -92,9 +92,6 @@ struct COL
 	 completion:(void (^)(BOOL success))completion
 {
 	//Save inputs
-	self.host = host;
-	self.username = username;
-	self.database = database;
 
 	/*
 	Copy password into a global C string. This is because in connectionSuccess: and connectionFailure:,
@@ -106,10 +103,14 @@ struct COL
 	copy the C string if it needs to be stored outside of the memory context in which you called this method."
 	https://developer.apple.com/library/mac/documentation/Cocoa/Reference/Foundation/Classes/NSString_Class/Reference/NSString.html#//apple_ref/occ/instm/NSString/UTF8String
 	 */
-	 _password = strdup([password UTF8String]);
 	
 	//Connect to database on worker queue
 	[self.workerQueue addOperationWithBlock:^{
+		self.host = host;
+		self.username = username;
+		self.database = database;
+		
+		_password = strdup([password UTF8String]);
 	
 		//Set login timeout
 		dbsetlogintime(self.timeout);
@@ -148,10 +149,7 @@ struct COL
 {
 	//Execute query on worker queue
 	[self.workerQueue addOperationWithBlock:^{
-		
-		//Set query timeout
-		dbsettime(self.timeout);
-		
+			
 		//Prepare SQL statement
 		dbcmd(connection, [sql UTF8String]);
 		
@@ -191,20 +189,12 @@ struct COL
 				//Get column metadata
 				pcol->name = dbcolname(connection, c);
 				pcol->type = dbcoltype(connection, c);
-                
-                //For IMAGE data, we need to multiply by 2, because dbbind() will convert each byte to a hexadecimal pair.
-                //http://www.freetds.org/userguide/samplecode.htm#SAMPLECODE.RESULTS
-                if(pcol->type == SYBIMAGE){
-                    pcol->size = dbcollen(connection, c) * 2;
-                }else{
-                    pcol->size = dbcollen(connection, c);
-                }
-
+				pcol->size = dbcollen(connection, c);
 				
-				//If the column is [VAR]CHAR or TEXT, we want the column's defined size, otherwise we want
+				//If the column is [VAR]CHAR, we want the column's defined size, otherwise we want
 				//its maximum size when represented as a string, which FreeTDS's dbwillconvert()
-				//returns (for fixed-length datatypes). We also do not need to convert IMAGE data type
-				if (pcol->type != SYBCHAR && pcol->type != SYBTEXT && pcol->type != SYBIMAGE)
+				//returns (for fixed-length datatypes).
+				if (pcol->type != SYBCHAR)
 					pcol->size = dbwillconvert(pcol->type, SYBCHAR);
 				
 				//Allocate memory in the current pcol struct for a buffer
@@ -242,35 +232,12 @@ struct COL
 						for (pcol = columns; pcol - columns < ncols; pcol++)
 						{
 							NSString* column = [NSString stringWithUTF8String:pcol->name];
-							id value;
-							if (pcol->status == -1) { //null value
-								value = [NSNull null];
-                                
-                            //Converting hexadecimal buffer into UIImage
-                            }else if (pcol ->type == SYBIMAGE){
-                                NSString *hexString = [[NSString stringWithUTF8String:pcol->buffer] stringByReplacingOccurrencesOfString:@" " withString:@""];
-                                NSMutableData *hexData = [[NSMutableData alloc] init];
-                                
-                                //Converting hex string to NSData
-                                unsigned char whole_byte;
-                                char byte_chars[3] = {'\0','\0','\0'};
-                                int i;
-                                for (i=0; i < [hexString length]/2; i++) {
-                                    byte_chars[0] = [hexString characterAtIndex:i*2];
-                                    byte_chars[1] = [hexString characterAtIndex:i*2+1];
-                                    whole_byte = strtol(byte_chars, NULL, 16);
-                                    [hexData appendBytes:&whole_byte length:1];
-                                }
-                                value = [UIImage imageWithData:hexData];
-                            }else {
-								value = [NSString stringWithUTF8String:pcol->buffer];
-							}
-							//id value = [NSString stringWithUTF8String:pcol->buffer] ?: [NSNull null];
+							id value = [NSString stringWithUTF8String:pcol->buffer] ?: [NSNull null];
 							row[column] = value;
-                            //printf("%@=%@\n", column, value);
+							//printf("%@=%@\n", column, value);
 						}
-                        
-                        //Add an immutable copy to the table
+						
+						//Add an immutable copy to the table
 						[table addObject:[row copy]];
 						//printf("\n");
 						break;
@@ -295,14 +262,16 @@ struct COL
 			[output addObject:[table copy]];
 		}
 		
-        //Success! Send an immutable copy of the results array
+		//Success! Send an immutable copy of the results array
 		[self executionSuccess:completion results:[output copy]];
 	}];
 }
 
 - (void)disconnect
 {
-    dbclose(connection);
+	[self.workerQueue addOperationWithBlock:^{
+		dbclose(connection);
+	}];
 }
 
 #pragma mark - Private
@@ -310,51 +279,51 @@ struct COL
 //Invokes connection completion handler on callback queue with success = NO
 - (void)connectionFailure:(void (^)(BOOL success))completion
 {
-    [self.callbackQueue addOperationWithBlock:^{
-        if (completion)
-            completion(NO);
-    }];
-    
-    //Cleanup
-    dbloginfree(login);
+	[self.callbackQueue addOperationWithBlock:^{
+		if (completion)
+			completion(NO);
+	}];
+	
+	//Cleanup
+	dbloginfree(login);
 	free(_password);
 }
 
 //Invokes connection completion handler on callback queue with success = [self connected]
 - (void)connectionSuccess:(void (^)(BOOL success))completion
 {
-    [self.callbackQueue addOperationWithBlock:^{
-        if (completion)
-            completion([self connected]);
-    }];
-    
-    //Cleanup
-    dbloginfree(login);
+	[self.callbackQueue addOperationWithBlock:^{
+		if (completion)
+			completion([self connected]);
+	}];
+	
+	//Cleanup
+	dbloginfree(login);
 	free(_password);
 }
 
 //Invokes execution completion handler on callback queue with results = nil
 - (void)executionFailure:(void (^)(NSArray* results))completion
 {
-    [self.callbackQueue addOperationWithBlock:^{
-        if (completion)
-            completion(nil);
-    }];
-    
-    //Clean up
-    dbfreebuf(connection);
+	[self.callbackQueue addOperationWithBlock:^{
+		if (completion)
+			completion(nil);
+	}];
+	
+	//Clean up
+	dbfreebuf(connection);
 }
 
 //Invokes execution completion handler on callback queue with results array
 - (void)executionSuccess:(void (^)(NSArray* results))completion results:(NSArray*)results
 {
-    [self.callbackQueue addOperationWithBlock:^{
-        if (completion)
-            completion(results);
-    }];
-    
-    //Clean up
-    dbfreebuf(connection);
+	[self.callbackQueue addOperationWithBlock:^{
+		if (completion)
+			completion(results);
+	}];
+	
+	//Clean up
+	dbfreebuf(connection);
 }
 
 //Handles message callback from FreeTDS library.
